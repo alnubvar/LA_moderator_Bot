@@ -1,15 +1,15 @@
+import re
 from aiogram import types
-from aiogram.dispatcher.filters import Command
 from aiogram.types import Message
-from config import dp  
 from handlers.log_users import log_user
 from data.message_logger import log_message
 from utils.config_loader import load_config
-import re
+from utils.db import add_or_update_user, mark_violator
 
 config = load_config()
 WHITELIST = config.get("whitelist", [])
 BAD_PATTERNS = config.get("bad_patterns", [])
+
 
 async def check_message(message: Message):
     user = message.from_user
@@ -25,11 +25,21 @@ async def check_message(message: Message):
             await message.answer(
                 f"⛔️ @{user.username or user.full_name}, реклама запрещена. Для размещения — напишите админу @AdmLosAngel"
             )
+            await mark_violator(user.id)  # обязательно await
             return
 
-@dp.message_handler()
-async def handle_message(message: types.Message):
+
+async def handle_message(message: Message):
+    await add_or_update_user(
+        message.from_user.id,
+        message.from_user.username,
+        message.from_user.first_name,
+        message.from_user.last_name,
+        violator=False
+    )
     await log_user(message)
+
 
 def register_handlers(dp):
     dp.register_message_handler(check_message, content_types=types.ContentTypes.TEXT)
+    dp.register_message_handler(handle_message, content_types=types.ContentTypes.TEXT)
