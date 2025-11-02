@@ -1,14 +1,35 @@
 {
-  "whitelist": [
+  "ads_contact_username": "@AdmLosAngel",
+  "admin_usernames": [
+    "@alnubvar",
     "@AdmLosAngel",
-    "@AnotherAdvertiser"
+    "@alha007"
   ],
+  "whitelist": [],
   "bad_patterns": [
-    "помогу\\s+приятно\\s+время",
+    "t\\.me/\\w+",
+    "https?://\\S+",
+    "помогу\\s+приятно.*время",
     "заработай\\s+без\\s+вложений",
     "подпишись\\s+на\\s+канал",
     "работа\\s+для\\s+девушек",
     "ежедневный\\s+доход",
-    "сайт\\s+для\\s+знакомств"
-  ]
+    "сайт\\s+для\\s+знакомств",
+    "массаж",
+    "фотограф",
+    "авто",
+    "телефон",
+    "запись",
+    "фотосессия"
+  ],
+  "ml": {
+    "enabled": true,
+    "threshold": 0.7,
+    "only_warn": true
+  },
+  "sanctions": {
+    "first_violation_mute_hours": 24,
+    "repeat_violation_mute_days": 30,
+    "third_violation_ban": true
+  }
 }

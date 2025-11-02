@@ -192,3 +192,29 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Local data
+data/users.db
+data/ml/
+data/backups
+*.db
+*.sqlite
+# --- Secrets and configs ---
+.env
+.env.*
+!.env.example
+config.json
+
+# --- Logs ---
+logs/
+*.log
+*.tmp
+
+# --- ML datasets and training ---
+data/ml_autotrain.log
+data/ml_dataset.csv
+
+# --- Temporary Python stuff ---
+__pycache__/
+*.py[cod]
+*$py.class
