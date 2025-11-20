@@ -10,6 +10,7 @@ import threading
 import json
 import matplotlib.pyplot as plt
 from io import BytesIO
+from main import AUTOTRAIN_PATH, LOG_PATH
 from aiogram.types import InputFile
 from datetime import datetime
 from pathlib import Path
@@ -87,7 +88,7 @@ def _is_admin(username: str, user_id: int) -> bool:
 
 
 async def train_ml_command(message: types.Message):
-    """Команда /train_ml — запускает автообучение ML модели (с таймером и логами)."""
+    """Команда /train_ml — запускает автообучение ML модели."""
     user = message.from_user
 
     # --- Проверка прав доступа ---
@@ -99,11 +100,7 @@ async def train_ml_command(message: types.Message):
         await message.reply("🚫 У вас нет прав на запуск обучения.")
         return
 
-    # --- Определяем путь до ml_autotrain.py ---
-    base_dir = Path(__file__).resolve().parent
-    while base_dir.name not in ("LA_moderator_Bot", "") and base_dir.parent != base_dir:
-        base_dir = base_dir.parent
-    script_path = base_dir / "ml_autotrain.py"
+    script_path = AUTOTRAIN_PATH  # ← ВАЖНО! Берём правильный путь из main.py
 
     if not script_path.exists():
         await message.reply(
@@ -112,17 +109,13 @@ async def train_ml_command(message: types.Message):
         )
         return
 
-    await message.reply(
-        f"🧠 Запускаю автообучение модели... Это займёт немного времени ⏳\n\n"
-    )
+    await message.reply("🧠 Запускаю обучение модели... ⏳")
 
-    # Захватываем event loop aiogram
     loop = asyncio.get_running_loop()
 
     def run_train():
         try:
             start_time = time.time()
-            print(f"🚀 TRAIN_ML THREAD STARTED ({script_path})", flush=True)
 
             result = subprocess.run(
                 [sys.executable, str(script_path)],
@@ -133,22 +126,19 @@ async def train_ml_command(message: types.Message):
             )
 
             duration = time.time() - start_time
-            print(
-                f"✅ TRAIN_ML THREAD FINISHED ({result.returncode}) за {duration:.2f} сек.",
-                flush=True,
-            )
 
             if result.returncode == 0:
+                # читаем последние строки лога
                 if LOG_PATH.exists():
                     log_tail = LOG_PATH.read_text(
                         encoding="utf-8", errors="ignore"
                     ).splitlines()[-20:]
                     log_text = "\n".join(log_tail)
                 else:
-                    log_text = "⚠️ Лог не найден, но обучение завершилось."
+                    log_text = "⚠️ Лог не найден."
 
                 text = (
-                    f"✅ Обучение завершено успешно.\n"
+                    "✅ Обучение завершено успешно.\n"
                     f"⏱ Время: {duration:.2f} сек.\n\n"
                     f"<pre>{log_text}</pre>"
                 )
@@ -159,18 +149,17 @@ async def train_ml_command(message: types.Message):
                 err = result.stderr or "Неизвестная ошибка"
                 asyncio.run_coroutine_threadsafe(
                     message.reply(
-                        f"❌ Ошибка при обучении (код {result.returncode}):\n<pre>{err[-1000:]}</pre>",
+                        f"❌ Ошибка обучения (код {result.returncode}):\n<pre>{err[-1000:]}</pre>",
                         parse_mode="HTML",
                     ),
                     loop,
                 )
-
         except Exception as e:
             asyncio.run_coroutine_threadsafe(
-                message.reply(f"💥 Ошибка запуска обучения: {e}"), loop
+                message.reply(f"💥 Ошибка запуска обучения: {e}"),
+                loop,
             )
 
-    # --- Запускаем в отдельном потоке ---
     threading.Thread(target=run_train, daemon=True).start()
 
 
