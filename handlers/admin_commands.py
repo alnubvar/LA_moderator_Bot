@@ -10,7 +10,7 @@ import threading
 import json
 import matplotlib.pyplot as plt
 from io import BytesIO
-from main import AUTOTRAIN_PATH, LOG_PATH
+from main import AUTOTRAIN_PATH
 from aiogram.types import InputFile
 from datetime import datetime
 from pathlib import Path
