@@ -99,6 +99,9 @@ bot: Bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp: Dispatcher = Dispatcher(bot, storage=storage)
 shutdown_flag: asyncio.Event = asyncio.Event()
 
+# Абсолютный путь к ml_autotrain.py независимо от того, где запущен бот
+AUTOTRAIN_PATH = Path(__file__).resolve().parent / "ml_autotrain.py"
+
 
 async def _autotrain_loop():
     logger = logging.getLogger("LA_Moderator_Bot")
@@ -111,7 +114,7 @@ async def _autotrain_loop():
         try:
             logger.info("🧠 Автообучение: запускаю ml_autotrain.py ...")
             result = subprocess.run(
-                [sys.executable, "ml_autotrain.py"],
+                [sys.executable, str(AUTOTRAIN_PATH)],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",

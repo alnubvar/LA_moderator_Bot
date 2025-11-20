@@ -4,20 +4,68 @@ import pandas as pd
 import re
 from pathlib import Path
 
+# --- Детект языка ---
+
+ARMENIAN_RE = re.compile(r"[\u0530-\u058F]")
+RUSSIAN_RE = re.compile(r"[а-яёА-ЯЁ]")
+ENGLISH_RE = re.compile(r"[a-zA-Z]")
+
+ARMENIAN_TRANSLIT_WORDS = {
+    "barev",
+    "lav",
+    "shnorh",
+    "hayeren",
+    "jan",
+    "sirum",
+    "inch",
+    "vor",
+    "araj",
+    "karas",
+    "kex",
+    "qez",
+    "chisht",
+    "nkarel",
+}
+
+
+def detect_language(text: str) -> str:
+    text = text or ""
+    text_low = text.lower()
+
+    if ARMENIAN_RE.search(text):
+        return "hy"  # Armenian
+
+    if RUSSIAN_RE.search(text):
+        return "ru"
+
+    if any(w in text_low for w in ARMENIAN_TRANSLIT_WORDS):
+        return "hy-translit"
+
+    if ENGLISH_RE.search(text):
+        return "en"
+
+    return "unknown"
+
+
+# --- Пути ---
+
 DB_PATH = Path("data/users.db")
 CSV_PATH = Path("data/ml_dataset.csv")
 KNOWN_PATH = Path("data/ml/known_texts.txt")
 
 
-def filter_known_texts(df):
+def filter_known_texts(df: pd.DataFrame) -> pd.DataFrame:
     """Отфильтровывает уже известные тексты (из прошлых обучений)."""
     if not KNOWN_PATH.exists():
         return df
     known = set(
-        line.strip() for line in KNOWN_PATH.read_text(encoding="utf-8").splitlines()
+        line.strip()
+        for line in KNOWN_PATH.read_text(encoding="utf-8").splitlines()
+        if line.strip()
     )
-    df = df[~df["clean_text"].isin(known)]
-    return df
+    if not known:
+        return df
+    return df[~df["clean_text"].isin(known)]
 
 
 def clean_text(s: str) -> str:
@@ -48,23 +96,52 @@ def read_db() -> pd.DataFrame:
     )
     conn.close()
 
+    # базовые поля
     df["is_ad"] = df["is_ad"].fillna(0).astype(int)
-    df["clean_text"] = df["text"].astype(str).apply(clean_text)
-    # фильтруем мусор
+
+    # язык
+    df["language"] = df["text"].astype(str).apply(detect_language)
+
+    # clean_text с префиксом языка
+    df["clean_text"] = df.apply(
+        lambda row: f"lang_{row['language']} " + clean_text(str(row["text"])),
+        axis=1,
+    )
+
+    # фильтрация мусора
     df = df[df["clean_text"].str.len() >= 5]
     df = df[~df["clean_text"].str.match(r"^[0-9\s]+$")]
+
     return df
 
 
 def read_csv_safe() -> pd.DataFrame:
     if not CSV_PATH.exists():
-        return pd.DataFrame(columns=["id", "username", "text", "is_ad", "clean_text"])
+        return pd.DataFrame(
+            columns=["id", "username", "text", "is_ad", "clean_text", "language"]
+        )
+
     df = pd.read_csv(CSV_PATH, on_bad_lines="skip", engine="python")
-    if "clean_text" not in df.columns:
-        df["clean_text"] = df["text"].astype(str).apply(clean_text)
+
+    # гарантируем наличие колонок
+    if "text" not in df.columns:
+        df["text"] = df.get("raw_text", "")
+
+    # язык — ВСЕГДА пересчитываем
+    df["language"] = df["text"].astype(str).apply(detect_language)
+
+    # clean_text — тоже пересчитываем в новом формате
+    df["clean_text"] = df.apply(
+        lambda row: f"lang_{row['language']} " + clean_text(str(row["text"])),
+        axis=1,
+    )
+
     df["is_ad"] = df["is_ad"].fillna(0).astype(int)
+
+    # фильтрация мусора
     df = df[df["clean_text"].str.len() >= 5]
     df = df[~df["clean_text"].str.match(r"^[0-9\s]+$")]
+
     return df
 
 

@@ -336,10 +336,11 @@ def register_chat(chat_id: int, title: str):
             )
             # создаём фоновую задачу, чтобы не блокировать поток
             try:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 loop.create_task(bot.send_message(admin_id, text))
             except RuntimeError:
-                # если loop ещё не запущен (например, при старте)
+                # если нет активного цикла (например при init_db)
+                # отправим синхронно
                 asyncio.run(bot.send_message(admin_id, text))
 
         except Exception as e:

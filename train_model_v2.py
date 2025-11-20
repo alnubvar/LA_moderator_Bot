@@ -112,7 +112,7 @@ def append_f1_to_history(f1_value: float, model_name: str):
 
     record = {
         "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "f1": round(float(f1_value), 3),
+        "f1": round(float(f1_value), 3), 
         "model": model_name,
     }
 
