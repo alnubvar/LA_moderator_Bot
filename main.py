@@ -183,7 +183,7 @@ async def set_bot_menu():
         ),
         types.BotCommand(command="/ads", description="💲 Узнать цены на рекламу"),
         types.BotCommand(command="/set_ads", description="⚙️ Изменить текст рекламы"),
-        types.BotCommand(command="/shutdown", description="🛑 Остановить бота"),
+        # types.BotCommand(command="/shutdown", description="🛑 Остановить бота"),
     ]
 
     await bot.set_my_commands(commands)

@@ -94,6 +94,10 @@ def read_db() -> pd.DataFrame:
         """,
         conn,
     )
+
+    if "is_ad" not in df.columns:
+        df["is_ad"] = 0
+
     conn.close()
 
     # базовые поля

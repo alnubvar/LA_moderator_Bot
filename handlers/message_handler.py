@@ -283,6 +283,10 @@ async def check_message(message: Message):
         is_ad_by_pattern = any(pattern.search(text) for pattern in BAD_PATTERNS)
         # 2) ML (только если паттерн не сработал)
         is_ad_by_ml, ml_conf = False, 0.0
+        logger.info(
+            f"[CHAT {message.chat.id}] detect: pattern={is_ad_by_pattern} ml={is_ad_by_ml} conf={ml_conf:.2f} text={text[:80]!r}"
+        )
+
         if ML_ENABLED and not is_ad_by_pattern:
             is_ad_by_ml, ml_conf = ml_predict_is_ad(text)
 
@@ -505,7 +509,21 @@ async def handle_message(message: Message):
 
 def register_handlers(dp):
     logger.info("🔌 Регистрация message handlers")
-    dp.register_message_handler(handle_message, content_types=types.ContentTypes.ANY)
+    dp.register_message_handler(handle_message, content_types=types.ContentTypes.TEXT)
+
+    dp.register_message_handler(
+        handle_message,
+        content_types=[
+            types.ContentTypes.PHOTO,
+            types.ContentTypes.VIDEO,
+            types.ContentTypes.DOCUMENT,
+            types.ContentTypes.ANIMATION,
+            types.ContentTypes.AUDIO,
+            types.ContentTypes.VOICE,
+            types.ContentTypes.VIDEO_NOTE,
+            types.ContentTypes.STICKER,
+        ],
+    )
 
 
 def register_message_handlers(dp):
