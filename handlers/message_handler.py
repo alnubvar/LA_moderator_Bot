@@ -1,11 +1,11 @@
 import re
+import json
+from pathlib import Path
 from joblib import load
 import logging
 from datetime import timedelta, datetime
 from typing import Set, Dict
 import pytz
-from pathlib import Path
-
 from aiogram import types
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.exceptions import BadRequest, MessageToDeleteNotFound
@@ -16,9 +16,6 @@ from utils.db import (
     get_ad_count,
     increment_ad_count,
     register_chat,
-    in_whitelist,
-    bump_violation,
-    add_message,
 )
 from utils.config_loader import CONFIG
 
@@ -37,26 +34,26 @@ SANCTIONS = config.get("sanctions", {})
 ml_cfg = config.get("ml", {}) if isinstance(config, dict) else {}
 ML_ENABLED = bool(ml_cfg.get("enabled", False))
 ML_THRESHOLD = float(ml_cfg.get("threshold", 0.7))
+ML_ONLY_WARN = bool(ml_cfg.get("only_warn", False))
+
+# «Сомнительные» кейсы (на ручную разметку)
+ML_REVIEW_LOW = float(ml_cfg.get("review_low", 0.40))
+ML_REVIEW_HIGH = float(ml_cfg.get("review_high", ML_THRESHOLD))
 
 MODEL = None
 VECTORIZER = None
 
-# Railway-safe пути (не меняет логику, только делает стабильнее)
-BASE_DIR = Path(__file__).resolve().parent.parent
-MODEL_PATH = BASE_DIR / "data" / "ml" / "best_model.pkl"
-VECTORIZER_PATH = BASE_DIR / "data" / "ml" / "vectorizer.pkl"
-
 if ML_ENABLED:
     try:
-        MODEL = load(MODEL_PATH)
-        VECTORIZER = load(VECTORIZER_PATH)
+        MODEL = load("data/ml/best_model.pkl")
+        VECTORIZER = load("data/ml/vectorizer.pkl")
         logger.info("🤖 ML-модель загружена (best_model.pkl).")
     except Exception as e:
         logger.error(f"❌ Не удалось загрузить ML-модель: {e}")
         ML_ENABLED = False
 
 # === Настройки ===
-MAX_DAILY_ADS = 4
+MAX_DAILY_ADS = 4  # дефолтное значение, но теперь оно приходит из БД
 BAD_PATTERNS = [re.compile(p, re.IGNORECASE) for p in BAD_PATTERNS_RAW]
 _ADMIN_CACHE: Dict[int, Set[int]] = {}
 
@@ -67,6 +64,30 @@ LA_TZ = pytz.timezone("America/Los_Angeles")
 def la_today_date() -> str:
     """Возвращает сегодняшнюю дату в зоне Лос-Анджелеса (YYYY-MM-DD)."""
     return datetime.now(LA_TZ).date().isoformat()
+
+
+# ---------- review storage (сомнительные кейсы ML) ----------
+
+REVIEW_DIR = Path("data/ml/review")
+REVIEW_DIR.mkdir(parents=True, exist_ok=True)
+REVIEW_FILE = REVIEW_DIR / "needs_review.jsonl"
+
+
+def save_for_ml_review(message: Message, confidence: float):
+    """Сохраняет пограничные кейсы ML в jsonl для ручной разметки."""
+    try:
+        record = {
+            "ts": datetime.utcnow().isoformat(),
+            "chat_id": message.chat.id,
+            "user_id": message.from_user.id if message.from_user else None,
+            "username": (message.from_user.username if message.from_user else None),
+            "confidence": round(float(confidence), 4),
+            "text": (message.text or message.caption or "").strip(),
+        }
+        with REVIEW_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось сохранить ML-review кейс: {e}")
 
 
 # ---------- утилиты ----------
@@ -88,6 +109,7 @@ async def _is_admin(message: Message) -> bool:
     user_id = message.from_user.id if message.from_user else None
     if user_id is None:
         return False
+
     admins = _ADMIN_CACHE.get(chat_id)
     if admins is None:
         admins = set()
@@ -101,11 +123,32 @@ async def _is_admin(message: Message) -> bool:
     return user_id in admins
 
 
-def _in_whitelist(user: types.User) -> bool:
-    # оставляем функцию (имя не меняем) для совместимости,
-    # но делаем безопасный вариант без поломки мультичата
-    uname = (user.username or "").strip()
-    return in_whitelist(None, uname) if uname else False
+def _in_whitelist(user: types.User, chat_id: int = None) -> bool:
+    """
+    Аккуратно: поддерживаем и глобальный whitelist (chat_id IS NULL),
+    и перс-чатный (chat_id = текущий).
+    """
+    uname = (user.username or "").strip().lower().lstrip("@")
+    if not uname:
+        return False
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        if chat_id is None:
+            row = cur.execute(
+                "SELECT 1 FROM whitelist WHERE LOWER(username)=?",
+                (uname,),
+            ).fetchone()
+            return bool(row)
+
+        row = cur.execute(
+            "SELECT 1 FROM whitelist WHERE (chat_id = ? OR chat_id IS NULL) AND LOWER(username)=?",
+            (chat_id, uname),
+        ).fetchone()
+        return bool(row)
+    finally:
+        conn.close()
 
 
 def _extract_text(message: Message) -> str:
@@ -152,6 +195,7 @@ def _bump_violation_counter(user: types.User) -> int:
     cur = conn.cursor()
     cur.execute("SELECT violation_count FROM users WHERE id = ?", (user.id,))
     row = cur.fetchone()
+
     if not row:
         new_val = 1
         cur.execute(
@@ -166,6 +210,7 @@ def _bump_violation_counter(user: types.User) -> int:
             "UPDATE users SET is_violator = 1, violation_count = ? WHERE id = ?",
             (new_val, user.id),
         )
+
     conn.commit()
     conn.close()
     return new_val
@@ -243,7 +288,11 @@ async def check_message(message: Message):
         if message.chat.type not in ("group", "supergroup"):
             return
 
-        # (ВАЖНО) register_chat УЖЕ делаем в handle_message(), чтобы не было дублей и личек
+        # Реестр чатов (мягко, без падений)
+        try:
+            register_chat(message.chat.id, message.chat.title or "")
+        except Exception:
+            pass
 
         # --- если сообщение от канала ---
         if message.sender_chat and not message.from_user:
@@ -270,8 +319,6 @@ async def check_message(message: Message):
             return
 
         user = message.from_user
-        if not user:
-            return
 
         # --- не трогаем админов чата ---
         if await _is_admin(message):
@@ -283,25 +330,56 @@ async def check_message(message: Message):
             return
 
         # === объединённая детекция рекламы ===
+        # 1) по паттернам
         is_ad_by_pattern = any(pattern.search(text) for pattern in BAD_PATTERNS)
 
+        # 2) ML (только если паттерн не сработал)
         is_ad_by_ml, ml_conf = False, 0.0
         if ML_ENABLED and not is_ad_by_pattern:
             is_ad_by_ml, ml_conf = ml_predict_is_ad(text)
 
-        logger.info(
-            f"[CHAT {message.chat.id}] detect: pattern={is_ad_by_pattern} ml={is_ad_by_ml} conf={ml_conf:.2f} text={text[:80]!r}"
-        )
-
         is_ad = is_ad_by_pattern or is_ad_by_ml
         is_media_msg = _is_media(message)
 
+        # ✅ ML_CHECK лог (наблюдаемость)
+        if ML_ENABLED:
+            logger.info(
+                f"🤖 ML_CHECK | user={user.username or user.id} "
+                f"| conf={ml_conf:.3f} "
+                f"| threshold={ML_THRESHOLD} "
+                f"| by_pattern={is_ad_by_pattern} "
+                f"| result={'AD' if is_ad else 'OK'} "
+                f"| text={text[:120]!r}"
+            )
+
+        # 📝 Сбор пограничных кейсов ML (только если паттерны не сработали)
+        if (
+            ML_ENABLED
+            and is_ad_by_ml
+            and (not is_ad_by_pattern)
+            and (ML_REVIEW_LOW <= ml_conf < ML_REVIEW_HIGH)
+        ):
+            save_for_ml_review(message, ml_conf)
+            logger.info(
+                f"📝 ML_REVIEW | conf={ml_conf:.3f} "
+                f"| user={user.username or user.id} "
+                f"| text={text[:100]!r}"
+            )
+            # логика не меняется: в таком случае дальше сработает only_warn/threshold как раньше
+
         # ✅ --- логика для рекламодателей (whitelist) ---
-        if in_whitelist(message.chat.id, user.username):
-            ad_count, daily_limit = get_ad_count(message.chat.id, user.id)
+        if _in_whitelist(user, chat_id=message.chat.id):
+            # получаем текущие данные по лимиту из БД (перс-чатно)
+            ad_data = get_ad_count(message.chat.id, user.id)
+            if ad_data and isinstance(ad_data, (list, tuple)) and len(ad_data) == 2:
+                ad_count, daily_limit = ad_data
+            else:
+                ad_count, daily_limit = 0, 4
+
             ad_count = int(ad_count or 0)
             daily_limit = int(daily_limit or 4)
 
+            # проверка лимита
             if ad_count < daily_limit:
                 increment_ad_count(message.chat.id, user.id)
                 logger.info(
@@ -335,6 +413,7 @@ async def check_message(message: Message):
                 except Exception:
                     pass
 
+                # конец текущего LA-дня
                 now_la = datetime.now(LA_TZ)
                 tomorrow_la = (now_la + timedelta(days=1)).replace(
                     hour=0, minute=0, second=0, microsecond=0
@@ -367,15 +446,11 @@ async def check_message(message: Message):
         if is_media_msg:
             try:
                 await message.delete()
-                logger.info(
-                    f"[CHAT {message.chat.id}] 🗑 Удалено медиа от {user.username or user.id}"
-                )
+                logger.info(f"🗑 Удалено медиа от {user.username or user.id}")
             except Exception as e:
                 logger.warning(f"⚠️ Ошибка удаления медиа: {e}")
-
-            violation_count = bump_violation(
-                message.chat.id, user.id, user.username or ""
-            )
+            mark_violator(user.id)
+            violation_count = _bump_violation_counter(user)
             mention = _mention_html_user(user)
             await _apply_sanction(
                 message, user.id, violation_count, mention, is_media=True
@@ -383,7 +458,7 @@ async def check_message(message: Message):
             return
 
         if is_ad:
-            ML_ONLY_WARN = bool(ml_cfg.get("only_warn", False))
+            # — Мягкий режим ML —
             if is_ad_by_ml and ML_ONLY_WARN and ml_conf < ML_THRESHOLD:
                 try:
                     await message.reply(
@@ -397,6 +472,7 @@ async def check_message(message: Message):
                     logger.warning(f"⚠️ Ошибка при мягком предупреждении: {e}")
                 return
 
+            # — Если реклама подтверждена (по паттерну или уверенно ML) —
             try:
                 await message.delete()
                 logger.info(
@@ -406,12 +482,11 @@ async def check_message(message: Message):
             except Exception as e:
                 logger.warning(f"⚠️ Ошибка удаления: {e}")
 
-            violation_count = bump_violation(
-                message.chat.id, user.id, user.username or ""
-            )
+            mark_violator(user.id)
+            violation_count = _bump_violation_counter(user)
             _mark_last_message_as_ad(user.id)
-
             mention = _mention_html_user(user)
+
             warn = (
                 f"⛔️ {mention}, реклама в этой группе <b>платная</b>.\n\n"
                 f"По вопросам рекламы — {ADS_CONTACT} ✅"
@@ -480,14 +555,6 @@ async def _apply_sanction(
 
 
 async def handle_message(message: Message):
-    # работаем ТОЛЬКО в группах
-    if message.chat.type not in ("group", "supergroup"):
-        return
-
-    # регистрируем чат (теперь здесь, чтобы лички не попадали в БД)
-    register_chat(message.chat.id, message.chat.title or "")
-
-    # сохраняем юзера
     if message.from_user:
         add_or_update_user(
             message.from_user.id,
@@ -497,37 +564,22 @@ async def handle_message(message: Message):
             violator=False,
         )
 
-    # сохраняем сообщение ОДИН РАЗ
     text = message.text or message.caption
     if text and message.from_user:
-        add_message(
-            chat_id=message.chat.id,
-            user_id=message.from_user.id,
-            username=message.from_user.username,
-            text=text,
-            is_ad=0,
+        conn = get_connection()
+        conn.execute(
+            "INSERT INTO messages (user_id, username, text) VALUES (?, ?, ?)",
+            (message.from_user.id, message.from_user.username, text),
         )
+        conn.commit()
+        conn.close()
 
     await check_message(message)
 
 
 def register_handlers(dp):
     logger.info("🔌 Регистрация message handlers")
-    dp.register_message_handler(handle_message, content_types=types.ContentTypes.TEXT)
-
-    dp.register_message_handler(
-        handle_message,
-        content_types=[
-            types.ContentTypes.PHOTO,
-            types.ContentTypes.VIDEO,
-            types.ContentTypes.DOCUMENT,
-            types.ContentTypes.ANIMATION,
-            types.ContentTypes.AUDIO,
-            types.ContentTypes.VOICE,
-            types.ContentTypes.VIDEO_NOTE,
-            types.ContentTypes.STICKER,
-        ],
-    )
+    dp.register_message_handler(handle_message, content_types=types.ContentTypes.ANY)
 
 
 def register_message_handlers(dp):

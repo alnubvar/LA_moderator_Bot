@@ -99,6 +99,10 @@ bot: Bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp: Dispatcher = Dispatcher(bot, storage=storage)
 shutdown_flag: asyncio.Event = asyncio.Event()
 
+# === ML flags ===
+AUTOTRAIN_ENABLED = False  # ❗ временно отключаем автотрейн
+
+
 # Абсолютный путь к ml_autotrain.py независимо от того, где запущен бот
 AUTOTRAIN_PATH = Path(__file__).resolve().parent / "ml_autotrain.py"
 
@@ -271,7 +275,11 @@ async def run_bot():
     await set_bot_menu()
 
     # 4) Запуск сторожа выключения и polling
-    asyncio.get_event_loop().create_task(_autotrain_loop())
+    if AUTOTRAIN_ENABLED:
+        asyncio.get_event_loop().create_task(_autotrain_loop())
+    else:
+        logger.warning("🧠 Автообучение ML отключено (AUTOTRAIN_ENABLED = False)")
+
 
     # Фоновая задача: ежедневная ротация логов
     asyncio.create_task(rotate_logs_daily())
