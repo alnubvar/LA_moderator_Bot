@@ -449,7 +449,6 @@ async def check_message(message: Message):
                 logger.info(f"🗑 Удалено медиа от {user.username or user.id}")
             except Exception as e:
                 logger.warning(f"⚠️ Ошибка удаления медиа: {e}")
-            mark_violator(user.id)
             violation_count = _bump_violation_counter(user)
             mention = _mention_html_user(user)
             await _apply_sanction(
@@ -482,7 +481,6 @@ async def check_message(message: Message):
             except Exception as e:
                 logger.warning(f"⚠️ Ошибка удаления: {e}")
 
-            mark_violator(user.id)
             violation_count = _bump_violation_counter(user)
             _mark_last_message_as_ad(user.id)
             mention = _mention_html_user(user)

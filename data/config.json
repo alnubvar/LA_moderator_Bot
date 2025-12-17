@@ -19,7 +19,11 @@
     "https?://\\S+"
   ],
   "ml": {
-    "enabled": false
+    "enabled": true,
+    "threshold": 0.7,
+    "only_warn": true,
+    "review_low": 0.4,
+    "review_high": 0.7
   },
   "sanctions": {
     "first_violation_mute_hours": 24,
