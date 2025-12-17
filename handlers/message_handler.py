@@ -294,7 +294,15 @@ async def check_message(message: Message):
         except Exception:
             pass
 
-        # --- если сообщение от канала ---
+        # =========================================================
+        # ❌ сообщение от имени чата / анонимного админа — ИГНОРИРУЕМ
+        # =========================================================
+        if message.sender_chat and message.sender_chat.id == message.chat.id:
+            return
+
+        # =========================================================
+        # ✅ сообщение от ВНЕШНЕГО канала
+        # =========================================================
         if message.sender_chat and not message.from_user:
             text = _extract_text(message)
             is_ad_like = bool(text and any(p.search(text) for p in BAD_PATTERNS))
@@ -306,9 +314,11 @@ async def check_message(message: Message):
                     )
                 except Exception as e:
                     logger.warning(f"⚠️ Не удалось удалить пост канала: {e}")
+
                 try:
                     await message.bot.ban_chat_sender_chat(
-                        chat_id=message.chat.id, sender_chat_id=message.sender_chat.id
+                        chat_id=message.chat.id,
+                        sender_chat_id=message.sender_chat.id,
                     )
                     await message.answer(
                         f"🚫 Канал <b>{message.sender_chat.title}</b> заблокирован за рекламу/медиа.",
@@ -319,6 +329,8 @@ async def check_message(message: Message):
             return
 
         user = message.from_user
+        if not user:
+            return
 
         # --- не трогаем админов чата ---
         if await _is_admin(message):
@@ -352,11 +364,11 @@ async def check_message(message: Message):
                 f"| text={text[:120]!r}"
             )
 
-        # 📝 Сбор пограничных кейсов ML (только если паттерны не сработали)
+        # 📝 Сбор пограничных кейсов ML
         if (
             ML_ENABLED
             and is_ad_by_ml
-            and (not is_ad_by_pattern)
+            and not is_ad_by_pattern
             and (ML_REVIEW_LOW <= ml_conf < ML_REVIEW_HIGH)
         ):
             save_for_ml_review(message, ml_conf)
@@ -365,11 +377,11 @@ async def check_message(message: Message):
                 f"| user={user.username or user.id} "
                 f"| text={text[:100]!r}"
             )
-            # логика не меняется: в таком случае дальше сработает only_warn/threshold как раньше
 
-        # ✅ --- логика для рекламодателей (whitelist) ---
+        # =========================================================
+        # ✅ whitelist (платные рекламодатели)
+        # =========================================================
         if _in_whitelist(user, chat_id=message.chat.id):
-            # получаем текущие данные по лимиту из БД (перс-чатно)
             ad_data = get_ad_count(message.chat.id, user.id)
             if ad_data and isinstance(ad_data, (list, tuple)) and len(ad_data) == 2:
                 ad_count, daily_limit = ad_data
@@ -379,7 +391,6 @@ async def check_message(message: Message):
             ad_count = int(ad_count or 0)
             daily_limit = int(daily_limit or 4)
 
-            # проверка лимита
             if ad_count < daily_limit:
                 increment_ad_count(message.chat.id, user.id)
                 logger.info(
@@ -403,7 +414,7 @@ async def check_message(message: Message):
                 )
                 logger.warning(
                     f"⚠️ @{user.username or user.id} превысил лимит рекламы "
-                    f"({daily_limit}/день). Предупреждён."
+                    f"({daily_limit}/день)."
                 )
                 return
 
@@ -413,7 +424,6 @@ async def check_message(message: Message):
                 except Exception:
                     pass
 
-                # конец текущего LA-дня
                 now_la = datetime.now(LA_TZ)
                 tomorrow_la = (now_la + timedelta(days=1)).replace(
                     hour=0, minute=0, second=0, microsecond=0
@@ -430,25 +440,23 @@ async def check_message(message: Message):
                     await message.answer(
                         f"🚫 @{user.username or user.full_name}, лимит рекламы "
                         f"({daily_limit}/сутки) превышен.\n"
-                        f"Вы ограничены до начала следующего дня (по времени Лос-Анджелеса).",
+                        f"Вы ограничены до начала следующего дня (LA-время).",
                         parse_mode="HTML",
-                    )
-                    logger.warning(
-                        f"🚫 @{user.username or user.id} ограничен до следующего LA-дня "
-                        f"(превышен лимит рекламы)."
                     )
                 except Exception as e:
                     logger.error(f"❌ Ошибка при ограничении рекламодателя: {e}")
                 return
 
-        # === дальше обычная логика наказаний ===
-
+        # =========================================================
+        # ❌ обычные нарушения
+        # =========================================================
         if is_media_msg:
             try:
                 await message.delete()
                 logger.info(f"🗑 Удалено медиа от {user.username or user.id}")
             except Exception as e:
                 logger.warning(f"⚠️ Ошибка удаления медиа: {e}")
+
             violation_count = _bump_violation_counter(user)
             mention = _mention_html_user(user)
             await _apply_sanction(
@@ -457,41 +465,36 @@ async def check_message(message: Message):
             return
 
         if is_ad:
-            # — Мягкий режим ML —
             if is_ad_by_ml and ML_ONLY_WARN and ml_conf < ML_THRESHOLD:
                 try:
                     await message.reply(
-                        f"🤖 Похоже, это реклама (уверенность {ml_conf:.2f}). Проверьте правила группы.",
+                        f"🤖 Похоже, это реклама (уверенность {ml_conf:.2f}). "
+                        f"Проверьте правила группы.",
                         parse_mode="HTML",
                     )
-                    logger.info(
-                        f"⚠️ Мягкое предупреждение (ML={ml_conf:.2f}) от {user.username or user.id}: {text[:80]!r}"
-                    )
-                except Exception as e:
-                    logger.warning(f"⚠️ Ошибка при мягком предупреждении: {e}")
+                except Exception:
+                    pass
                 return
 
-            # — Если реклама подтверждена (по паттерну или уверенно ML) —
             try:
                 await message.delete()
                 logger.info(
                     f"🗑 Удалён рекламный текст от {user.username or user.id} "
                     f"({'PATTERN' if is_ad_by_pattern else 'ML'})"
                 )
-            except Exception as e:
-                logger.warning(f"⚠️ Ошибка удаления: {e}")
+            except Exception:
+                pass
 
             violation_count = _bump_violation_counter(user)
             _mark_last_message_as_ad(user.id)
             mention = _mention_html_user(user)
 
-            warn = (
-                f"⛔️ {mention}, реклама в этой группе <b>платная</b>.\n\n"
-                f"По вопросам рекламы — {ADS_CONTACT} ✅"
-            )
             try:
                 await message.answer(
-                    warn, reply_markup=_ads_keyboard(), parse_mode="HTML"
+                    f"⛔️ {mention}, реклама в этой группе <b>платная</b>.\n\n"
+                    f"По вопросам рекламы — {ADS_CONTACT} ✅",
+                    reply_markup=_ads_keyboard(),
+                    parse_mode="HTML",
                 )
             except Exception:
                 pass
