@@ -4,9 +4,12 @@ import logging
 from datetime import timedelta, datetime
 from typing import Set, Dict
 import pytz
+from pathlib import Path
+
 from aiogram import types
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.exceptions import BadRequest, MessageToDeleteNotFound
+
 from utils.db import (
     add_or_update_user,
     get_connection,
@@ -15,6 +18,7 @@ from utils.db import (
     register_chat,
     in_whitelist,
     bump_violation,
+    add_message,
 )
 from utils.config_loader import CONFIG
 
@@ -32,24 +36,27 @@ SANCTIONS = config.get("sanctions", {})
 # === ML-конфиг ===
 ml_cfg = config.get("ml", {}) if isinstance(config, dict) else {}
 ML_ENABLED = bool(ml_cfg.get("enabled", False))
-ML_THRESHOLD = float(
-    ml_cfg.get("threshold", 0.7)
-)  # для совместимости, при LinearSVC это просто флаг
+ML_THRESHOLD = float(ml_cfg.get("threshold", 0.7))
 
 MODEL = None
 VECTORIZER = None
 
+# Railway-safe пути (не меняет логику, только делает стабильнее)
+BASE_DIR = Path(__file__).resolve().parent.parent
+MODEL_PATH = BASE_DIR / "data" / "ml" / "best_model.pkl"
+VECTORIZER_PATH = BASE_DIR / "data" / "ml" / "vectorizer.pkl"
+
 if ML_ENABLED:
     try:
-        MODEL = load("data/ml/best_model.pkl")
-        VECTORIZER = load("data/ml/vectorizer.pkl")
+        MODEL = load(MODEL_PATH)
+        VECTORIZER = load(VECTORIZER_PATH)
         logger.info("🤖 ML-модель загружена (best_model.pkl).")
     except Exception as e:
         logger.error(f"❌ Не удалось загрузить ML-модель: {e}")
         ML_ENABLED = False
 
 # === Настройки ===
-MAX_DAILY_ADS = 4  # дефолтное значение, но теперь оно приходит из БД
+MAX_DAILY_ADS = 4
 BAD_PATTERNS = [re.compile(p, re.IGNORECASE) for p in BAD_PATTERNS_RAW]
 _ADMIN_CACHE: Dict[int, Set[int]] = {}
 
@@ -95,13 +102,10 @@ async def _is_admin(message: Message) -> bool:
 
 
 def _in_whitelist(user: types.User) -> bool:
-    uname = (user.username or "").strip().lower().lstrip("@")
-    conn = get_connection()
-    row = conn.execute(
-        "SELECT 1 FROM whitelist WHERE LOWER(username)=?", (uname,)
-    ).fetchone()
-    conn.close()
-    return bool(row)
+    # оставляем функцию (имя не меняем) для совместимости,
+    # но делаем безопасный вариант без поломки мультичата
+    uname = (user.username or "").strip()
+    return in_whitelist(None, uname) if uname else False
 
 
 def _extract_text(message: Message) -> str:
@@ -217,7 +221,6 @@ def ml_predict_is_ad(raw_text: str):
             return False, 0.0
         X = VECTORIZER.transform([clean])
 
-        # поддержка вероятностей
         if hasattr(MODEL, "predict_proba"):
             probs = MODEL.predict_proba(X)[0]
             confidence = probs[1]
@@ -225,7 +228,7 @@ def ml_predict_is_ad(raw_text: str):
             return bool(pred), float(confidence)
         else:
             pred = MODEL.predict(X)[0]
-            return bool(pred), 1.0  # считаем уверенным, если без proba
+            return bool(pred), 1.0
     except Exception as e:
         logger.warning(f"⚠️ Ошибка ML-предсказания: {e}")
         return False, 0.0
@@ -236,12 +239,11 @@ def ml_predict_is_ad(raw_text: str):
 
 async def check_message(message: Message):
     try:
-        # === Регистрируем чат, если его ещё нет в БД ===
-        register_chat(message.chat.id, message.chat.title or "")
-
         # --- работаем только в группах ---
         if message.chat.type not in ("group", "supergroup"):
             return
+
+        # (ВАЖНО) register_chat УЖЕ делаем в handle_message(), чтобы не было дублей и личек
 
         # --- если сообщение от канала ---
         if message.sender_chat and not message.from_user:
@@ -268,6 +270,8 @@ async def check_message(message: Message):
             return
 
         user = message.from_user
+        if not user:
+            return
 
         # --- не трогаем админов чата ---
         if await _is_admin(message):
@@ -279,28 +283,22 @@ async def check_message(message: Message):
             return
 
         # === объединённая детекция рекламы ===
-        # 1) по паттернам
         is_ad_by_pattern = any(pattern.search(text) for pattern in BAD_PATTERNS)
-        # 2) ML (только если паттерн не сработал)
+
         is_ad_by_ml, ml_conf = False, 0.0
+        if ML_ENABLED and not is_ad_by_pattern:
+            is_ad_by_ml, ml_conf = ml_predict_is_ad(text)
+
         logger.info(
             f"[CHAT {message.chat.id}] detect: pattern={is_ad_by_pattern} ml={is_ad_by_ml} conf={ml_conf:.2f} text={text[:80]!r}"
         )
-
-        if ML_ENABLED and not is_ad_by_pattern:
-            is_ad_by_ml, ml_conf = ml_predict_is_ad(text)
 
         is_ad = is_ad_by_pattern or is_ad_by_ml
         is_media_msg = _is_media(message)
 
         # ✅ --- логика для рекламодателей (whitelist) ---
         if in_whitelist(message.chat.id, user.username):
-            ad_data = get_ad_count(message.chat.id, user.id)
-            if ad_data and isinstance(ad_data, (list, tuple)) and len(ad_data) == 2:
-                ad_count, daily_limit = ad_data
-            else:
-                ad_count, daily_limit = 0, 4
-
+            ad_count, daily_limit = get_ad_count(message.chat.id, user.id)
             ad_count = int(ad_count or 0)
             daily_limit = int(daily_limit or 4)
 
@@ -337,7 +335,6 @@ async def check_message(message: Message):
                 except Exception:
                     pass
 
-                # конец текущего LA-дня
                 now_la = datetime.now(LA_TZ)
                 tomorrow_la = (now_la + timedelta(days=1)).replace(
                     hour=0, minute=0, second=0, microsecond=0
@@ -375,6 +372,7 @@ async def check_message(message: Message):
                 )
             except Exception as e:
                 logger.warning(f"⚠️ Ошибка удаления медиа: {e}")
+
             violation_count = bump_violation(
                 message.chat.id, user.id, user.username or ""
             )
@@ -385,10 +383,8 @@ async def check_message(message: Message):
             return
 
         if is_ad:
-            # — Мягкий режим ML —
             ML_ONLY_WARN = bool(ml_cfg.get("only_warn", False))
             if is_ad_by_ml and ML_ONLY_WARN and ml_conf < ML_THRESHOLD:
-                # если сообщение поймано ML и уверенность ниже порога — просто предупредим
                 try:
                     await message.reply(
                         f"🤖 Похоже, это реклама (уверенность {ml_conf:.2f}). Проверьте правила группы.",
@@ -401,7 +397,6 @@ async def check_message(message: Message):
                     logger.warning(f"⚠️ Ошибка при мягком предупреждении: {e}")
                 return
 
-            # — Если реклама подтверждена (по паттерну или уверенно ML) —
             try:
                 await message.delete()
                 logger.info(
@@ -417,7 +412,6 @@ async def check_message(message: Message):
             _mark_last_message_as_ad(user.id)
 
             mention = _mention_html_user(user)
-
             warn = (
                 f"⛔️ {mention}, реклама в этой группе <b>платная</b>.\n\n"
                 f"По вопросам рекламы — {ADS_CONTACT} ✅"
@@ -486,6 +480,14 @@ async def _apply_sanction(
 
 
 async def handle_message(message: Message):
+    # работаем ТОЛЬКО в группах
+    if message.chat.type not in ("group", "supergroup"):
+        return
+
+    # регистрируем чат (теперь здесь, чтобы лички не попадали в БД)
+    register_chat(message.chat.id, message.chat.title or "")
+
+    # сохраняем юзера
     if message.from_user:
         add_or_update_user(
             message.from_user.id,
@@ -494,15 +496,17 @@ async def handle_message(message: Message):
             message.from_user.last_name,
             violator=False,
         )
+
+    # сохраняем сообщение ОДИН РАЗ
     text = message.text or message.caption
     if text and message.from_user:
-        conn = get_connection()
-        conn.execute(
-            "INSERT INTO messages (chat_id, user_id, username, text) VALUES (?, ?, ?, ?)",
-            (message.chat.id, message.from_user.id, message.from_user.username, text),
+        add_message(
+            chat_id=message.chat.id,
+            user_id=message.from_user.id,
+            username=message.from_user.username,
+            text=text,
+            is_ad=0,
         )
-        conn.commit()
-        conn.close()
 
     await check_message(message)
 
