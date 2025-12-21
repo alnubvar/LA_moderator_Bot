@@ -25,6 +25,7 @@ logger = logging.getLogger("LA_Moderator_Bot")
 # === Конфиг ===
 config = CONFIG
 ADS_CONTACT = config.get("ads_contact_username", "@AdmLosAngel")
+admin_link = f"<a href='https://t.me/{ADS_CONTACT.lstrip('@')}'>администратору</a>"
 ADMIN_USERNAMES = set(u.lower() for u in config.get("admin_usernames", []))
 WHITELIST_CFG = set(u.lower() for u in config.get("whitelist", []))
 BAD_PATTERNS_RAW = config.get("bad_patterns", [])
@@ -160,7 +161,7 @@ def _ads_keyboard() -> InlineKeyboardMarkup:
     kb.add(
         InlineKeyboardButton(
             text="Купить рекламу",
-            url=f"https://t.me/{ADS_CONTACT.lstrip('@')}",
+            url=f"https://t.me/m/cklnwc8eNDNi",
         )
     )
     return kb
@@ -520,7 +521,7 @@ async def check_message(message: Message):
             try:
                 await message.answer(
                     f"⛔️ {mention}, реклама в этой группе <b>платная</b>.\n\n"
-                    f"По вопросам рекламы — {ADS_CONTACT} ✅",
+                    f"По вопросам рекламы — напишите {admin_link} ✅",
                     reply_markup=_ads_keyboard(),
                     parse_mode="HTML",
                 )
