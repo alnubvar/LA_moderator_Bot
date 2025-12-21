@@ -458,16 +458,37 @@ async def check_message(message: Message):
         # ❌ обычные нарушения
         # =========================================================
         if is_media_msg:
+            # ⚠️ Медиа БЕЗ текста — считаем обычным сообщением (НЕ реклама)
+            if not text:
+                logger.info(
+                    f"📷 Медиа без текста от {user.username or user.id} — пропущено"
+                )
+                return
+
+            # ⛔ Медиа С текстом — проверяем как рекламу
+            if not is_ad:
+                logger.info(
+                    f"📷 Медиа с текстом от {user.username or user.id}, "
+                    f"но реклама не обнаружена — пропущено"
+                )
+                return
+
+            # 🚫 Медиа + реклама → удаляем и наказываем
             try:
                 await message.delete()
-                logger.info(f"🗑 Удалено медиа от {user.username or user.id}")
+                logger.info(f"🗑 Удалено рекламное медиа от {user.username or user.id}")
             except Exception as e:
                 logger.warning(f"⚠️ Ошибка удаления медиа: {e}")
 
             violation_count = _bump_violation_counter(user)
             mention = _mention_html_user(user)
+
             await _apply_sanction(
-                message, user.id, violation_count, mention, is_media=True
+                message,
+                user.id,
+                violation_count,
+                mention,
+                is_media=True,
             )
             return
 
