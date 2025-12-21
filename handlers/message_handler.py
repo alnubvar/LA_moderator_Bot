@@ -257,23 +257,30 @@ def _clean_text_for_ml(text: str) -> str:
 
 
 def ml_predict_is_ad(raw_text: str):
-    """Возвращает (bool, confidence) — реклама или нет и уверенность"""
-    if not ML_ENABLED or not MODEL or not VECTORIZER:
+    """
+    Возвращает (is_ad: bool, confidence: float)
+    confidence — вероятность класса "реклама"
+    """
+    if not ML_ENABLED or MODEL is None or VECTORIZER is None:
         return False, 0.0
+
     try:
         clean = _clean_text_for_ml(raw_text)
         if not clean:
             return False, 0.0
+
         X = VECTORIZER.transform([clean])
 
+        # Основной путь — predict_proba
         if hasattr(MODEL, "predict_proba"):
-            probs = MODEL.predict_proba(X)[0]
-            confidence = probs[1]
-            pred = 1 if confidence >= ML_THRESHOLD else 0
-            return bool(pred), float(confidence)
-        else:
-            pred = MODEL.predict(X)[0]
-            return bool(pred), 1.0
+            confidence = float(MODEL.predict_proba(X)[0][1])
+            is_ad = confidence >= ML_THRESHOLD
+            return is_ad, confidence
+
+        # Фолбэк (на всякий случай)
+        pred = MODEL.predict(X)[0]
+        return bool(pred), 1.0
+
     except Exception as e:
         logger.warning(f"⚠️ Ошибка ML-предсказания: {e}")
         return False, 0.0
