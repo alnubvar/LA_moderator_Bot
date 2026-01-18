@@ -690,10 +690,20 @@ async def _apply_sanction(
             )
 
         else:
-            await message.bot.kick_chat_member(chat_id=message.chat.id, user_id=user_id)
-            return (
-                f"🚫 {mention}, вы <b>забанены навсегда</b> "
-                f"за систематические нарушения."
+            # 🔒 Третье и последующие нарушения — перманентный мут (без кика из чата)
+            # Ставим очень далёкий until_date (10 лет), по факту — “навсегда”
+            years = 10
+            until = message.date + timedelta(days=365 * years)
+            await message.bot.restrict_chat_member(
+                chat_id=message.chat.id,
+                user_id=user_id,
+                permissions=types.ChatPermissions(can_send_messages=False),
+                until_date=until,
+            )
+            await message.answer(
+                f"🚫 {mention}, у вас уже <b>{violation_count} нарушений</b>.\n"
+                f"Вы <b>навсегда лишены возможности писать</b> в этот чат.",
+                parse_mode="HTML",
             )
 
     except Exception as e:
