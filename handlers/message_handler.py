@@ -1,5 +1,7 @@
 import re
 import json
+import asyncio
+import time
 from pathlib import Path
 from joblib import load
 import logging
@@ -31,6 +33,11 @@ WHITELIST_CFG = set(u.lower() for u in config.get("whitelist", []))
 BAD_PATTERNS_RAW = config.get("bad_patterns", [])
 SANCTIONS = config.get("sanctions", {})
 
+# Новые настройки уведомлений
+NOTIFY_DELETE_AFTER = int(config.get("notify_delete_after", 90))  # сек до автоделита
+NOTIFY_COOLDOWN = int(config.get("notify_cooldown", 30))  # сек кулдаун на юзера
+DM_NOTIFY = bool(config.get("dm_notify", True))  # слать ли в ЛС
+
 # === ML-конфиг ===
 ml_cfg = config.get("ml", {}) if isinstance(config, dict) else {}
 ML_ENABLED = bool(ml_cfg.get("enabled", False))
@@ -57,6 +64,9 @@ if ML_ENABLED:
 MAX_DAILY_ADS = 4  # дефолтное значение, но теперь оно приходит из БД
 BAD_PATTERNS = [re.compile(p, re.IGNORECASE) for p in BAD_PATTERNS_RAW]
 _ADMIN_CACHE: Dict[int, Set[int]] = {}
+
+# Анти-спам по уведомлениям (чтобы бот не флудил)
+_last_notify_ts: Dict[tuple, float] = {}  # key = (chat_id, user_id) -> unix_ts
 
 # === Временная зона Лос-Анджелеса ===
 LA_TZ = pytz.timezone("America/Los_Angeles")
@@ -161,7 +171,7 @@ def _ads_keyboard() -> InlineKeyboardMarkup:
     kb.add(
         InlineKeyboardButton(
             text="Купить рекламу",
-            url=f"https://t.me/m/cklnwc8eNDNi",
+            url="https://t.me/m/cklnwc8eNDNi",
         )
     )
     return kb
@@ -237,6 +247,45 @@ def _mark_last_message_as_ad(user_id: int):
         conn.close()
     except Exception as e:
         logger.warning(f"⚠️ Не удалось пометить сообщение как рекламное: {e}")
+
+
+# ---------- вспомогательные функции для уведомлений ----------
+
+
+async def _safe_delete(bot, chat_id: int, message_id: int, delay: int):
+    """Удалить сообщение через delay секунд, молча игнорируя ошибки."""
+    await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+
+def _cooldown_ok(chat_id: int, user_id: int, cooldown: int) -> bool:
+    """
+    True, если можно отправить уведомление в чат (не спамим одного и того же юзера).
+    """
+    now = time.time()
+    key = (chat_id, user_id)
+    last = _last_notify_ts.get(key, 0)
+    if now - last < cooldown:
+        return False
+    _last_notify_ts[key] = now
+    return True
+
+
+async def _notify_user_dm(bot, user_id: int, text: str):
+    """Отправка подробного уведомления в ЛС (если открыты)."""
+    try:
+        await bot.send_message(
+            user_id,
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        # ЛС закрыты / бот заблокирован и т.п.
+        pass
 
 
 # ---------- ML: очистка и предсказание ----------
@@ -484,16 +533,53 @@ async def check_message(message: Message):
             violation_count = _bump_violation_counter(user)
             mention = _mention_html_user(user)
 
-            await _apply_sanction(
+            warn = (
+                f"⛔️ {mention}, реклама/медиа в этой группе <b>платная</b>.\n\n"
+                f"По вопросам рекламы — напишите {admin_link} ✅"
+            )
+
+            sanction_line = await _apply_sanction(
                 message,
                 user.id,
                 violation_count,
                 mention,
                 is_media=True,
             )
+
+            # В ЛС подробное уведомление
+            if DM_NOTIFY:
+                dm_text = (
+                    f"{warn}\n\n"
+                    f"{sanction_line}\n\n"
+                    f"Медиа-сообщение было удалено в чате."
+                )
+                await _notify_user_dm(message.bot, user.id, dm_text)
+
+            # В чат — одно короткое сообщение с автоделитом + антиспам
+            if _cooldown_ok(message.chat.id, user.id, NOTIFY_COOLDOWN):
+                try:
+                    sent = await message.answer(
+                        f"{warn}\n\n{sanction_line}",
+                        reply_markup=_ads_keyboard(),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                    asyncio.create_task(
+                        _safe_delete(
+                            message.bot,
+                            message.chat.id,
+                            sent.message_id,
+                            NOTIFY_DELETE_AFTER,
+                        )
+                    )
+                except Exception:
+                    pass
+
             return
 
+        # --- обычный текст ---
         if is_ad:
+            # Режим "только предупреждаем" для мягкого теста ML
             if is_ad_by_ml and ML_ONLY_WARN and ml_conf < ML_THRESHOLD:
                 try:
                     await message.reply(
@@ -505,6 +591,7 @@ async def check_message(message: Message):
                     pass
                 return
 
+            # Удаляем сообщение
             try:
                 await message.delete()
                 logger.info(
@@ -518,19 +605,44 @@ async def check_message(message: Message):
             _mark_last_message_as_ad(user.id)
             mention = _mention_html_user(user)
 
-            try:
-                await message.answer(
-                    f"⛔️ {mention}, реклама в этой группе <b>платная</b>.\n\n"
-                    f"По вопросам рекламы — напишите {admin_link} ✅",
-                    reply_markup=_ads_keyboard(),
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
+            warn = (
+                f"⛔️ {mention}, реклама в этой группе <b>платная</b>.\n\n"
+                f"По вопросам рекламы — напишите {admin_link} ✅"
+            )
 
-            await _apply_sanction(
+            sanction_line = await _apply_sanction(
                 message, user.id, violation_count, mention, is_media=False
             )
+
+            # ЛС
+            if DM_NOTIFY:
+                dm_text = (
+                    f"{warn}\n\n"
+                    f"{sanction_line}\n\n"
+                    f"Сообщение было удалено в чате."
+                )
+                await _notify_user_dm(message.bot, user.id, dm_text)
+
+            # В группу — одно сообщение, автоудаление, кулдаун
+            if _cooldown_ok(message.chat.id, user.id, NOTIFY_COOLDOWN):
+                try:
+                    sent = await message.answer(
+                        f"{warn}\n\n{sanction_line}",
+                        reply_markup=_ads_keyboard(),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                    asyncio.create_task(
+                        _safe_delete(
+                            message.bot,
+                            message.chat.id,
+                            sent.message_id,
+                            NOTIFY_DELETE_AFTER,
+                        )
+                    )
+                except Exception:
+                    pass
+
             return
 
     except Exception as e:
@@ -543,8 +655,11 @@ async def _apply_sanction(
     violation_count: int,
     mention: str,
     is_media: bool = False,
-):
-    """Применяет наказания в зависимости от количества нарушений."""
+) -> str:
+    """
+    Применяет наказания в зависимости от количества нарушений
+    и возвращает строку для уведомления (но САМ ничего не шлёт).
+    """
     try:
         if violation_count == 1:
             hours = SANCTIONS.get("first_violation_mute_hours", 24)
@@ -555,10 +670,11 @@ async def _apply_sanction(
                 permissions=types.ChatPermissions(can_send_messages=False),
                 until_date=until,
             )
-            await message.answer(
-                f"⚠️ {mention}, это ваше <b>первое нарушение</b>.\nОграничение на <b>{hours} часов</b> ⏰",
-                parse_mode="HTML",
+            return (
+                f"⚠️ {mention}, это ваше <b>первое нарушение</b>. "
+                f"Ограничение на <b>{hours} часов</b> ⏰"
             )
+
         elif violation_count == 2:
             days = SANCTIONS.get("repeat_violation_mute_days", 30)
             until = message.date + timedelta(days=days)
@@ -568,19 +684,25 @@ async def _apply_sanction(
                 permissions=types.ChatPermissions(can_send_messages=False),
                 until_date=until,
             )
-            await message.answer(
-                f"📆 {mention}, это уже <b>второе нарушение</b>.\nОграничение на <b>{days} дней</b> 🚫",
-                parse_mode="HTML",
+            return (
+                f"📆 {mention}, это уже <b>второе нарушение</b>. "
+                f"Ограничение на <b>{days} дней</b> 🚫"
             )
+
         else:
             await message.bot.kick_chat_member(chat_id=message.chat.id, user_id=user_id)
-            await message.answer(
-                f"🚫 {mention}, вы <b>забанены навсегда</b> за систематические нарушения.",
-                parse_mode="HTML",
+            return (
+                f"🚫 {mention}, вы <b>забанены навсегда</b> "
+                f"за систематические нарушения."
             )
+
     except Exception as e:
         logger.warning(
             f"⚠️ Ошибка применения санкции ({'media' if is_media else 'text'}): {e}"
+        )
+        return (
+            f"⚠️ {mention}, нарушение зафиксировано, "
+            f"но применить санкцию не удалось."
         )
 
 

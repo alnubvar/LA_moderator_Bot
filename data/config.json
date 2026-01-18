@@ -20,14 +20,17 @@
   ],
   "ml": {
     "enabled": true,
-    "threshold": 0.45,
+    "threshold": 0.55,
     "only_warn": false,
-    "review_low": 0.35,
-    "review_high": 0.45
+    "review_low": 0.45,
+    "review_high": 0.55
   },
   "sanctions": {
     "first_violation_mute_hours": 24,
     "repeat_violation_mute_days": 30,
     "third_violation_ban": true
-  }
+  },
+  "notify_delete_after": 90,
+  "notify_cooldown": 30,
+  "dm_notify": true
 }
